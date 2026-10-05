@@ -1,4 +1,4 @@
-"""编排流程测试：重复提交、并发争用、失败分类与重试、维护窗口、崩溃恢复。"""
+"""编排流程测试：重复提交、并发争用、失败分类与重试、维护窗口、崩溃恢复、优先级调度与防饿死。"""
 import logging
 import threading
 import time
@@ -22,9 +22,11 @@ logging.basicConfig(
 logger = logging.getLogger("test")
 
 
-def make_service(handler, max_concurrency=2, max_retries=3, db_path=":memory:"):
+def make_service(handler, max_concurrency=2, max_retries=3, db_path=":memory:",
+                 aging_threshold=30.0):
     svc = OrchestratorService(
-        handler, db_path=db_path, max_concurrency=max_concurrency, max_retries=max_retries
+        handler, db_path=db_path, max_concurrency=max_concurrency,
+        max_retries=max_retries, aging_threshold=aging_threshold,
     )
     svc.start()
     return svc
@@ -107,8 +109,11 @@ def test_retryable_failure_retries_then_succeeds(caplog):
         assert attempts["n"] == 3
         assert job.attempts == 3
         logger.info("job=%s succeeded after %d attempts", job.job_id, job.attempts)
-        retry_logs = [r for r in caplog.records if "class=RETRYABLE" in r.getMessage()]
-        assert len(retry_logs) == 2  # 前两次失败被分类为可重试
+        retry_logs = [
+            r for r in caplog.records
+            if r.name == "orchestrator.scheduler" and "class=RETRYABLE" in r.getMessage()
+        ]
+        assert len(retry_logs) == 2  # 前两次失败被分类为可重试（仅统计调度器的重试日志）
     finally:
         svc.stop()
 
@@ -227,5 +232,173 @@ def test_crash_recovery_requeues_interrupted(tmp_path):
         job = wait_status(svc, "job-stuck", JobStatus.SUCCEEDED)
         assert done == ["p"]
         logger.info("job=%s recovered and completed, attempts=%d", job.job_id, job.attempts)
+    finally:
+        svc.stop()
+
+
+# ---- 优先级调度 ----
+
+
+def test_priority_dispatch_order():
+    """不同优先级：高的先派发；并发上限不被优先级突破。"""
+    started = []
+    release = threading.Event()
+
+    def handler(payload):
+        started.append(payload)
+        release.wait(timeout=5)
+
+    svc = make_service(handler, max_concurrency=1)
+    try:
+        svc.submit("blocker", "blocker")  # 占住唯一执行槽
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not started:
+            time.sleep(0.01)
+        assert started == ["blocker"]
+        # 按 低->普通->高 的相反顺序提交，验证不是按提交顺序派发
+        svc.submit("job-low", "low", priority="low")
+        svc.submit("job-normal", "normal", priority="normal")
+        svc.submit("job-high", "high", priority="high")
+        time.sleep(0.1)
+        # 优先级不能突破并发上限：仍然只有 1 个在跑
+        assert svc.running_count() == 1
+        assert svc.get("job-high").status == JobStatus.QUEUED
+        release.set()
+        assert svc.wait_idle()
+        assert started == ["blocker", "high", "normal", "low"]
+        logger.info("priority dispatch order: %s", started)
+    finally:
+        release.set()
+        svc.stop()
+
+
+def test_same_priority_is_fifo():
+    """同优先级内部先来先服务，不被优先级机制打乱。"""
+    started = []
+    release = threading.Event()
+
+    def handler(payload):
+        started.append(payload)
+        release.wait(timeout=5)
+
+    svc = make_service(handler, max_concurrency=1)
+    try:
+        svc.submit("blocker", "blocker")
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not started:
+            time.sleep(0.01)
+        for i in range(4):
+            svc.submit(f"job-{i}", f"p{i}", priority="low")
+        release.set()
+        assert svc.wait_idle()
+        assert started == ["blocker", "p0", "p1", "p2", "p3"]
+        logger.info("same-priority fifo order: %s", started)
+    finally:
+        release.set()
+        svc.stop()
+
+
+def test_low_priority_eventually_dispatched_under_high_pressure():
+    """防饿死：高优先级持续涌入时，低优先级等待超过 aging 阈值后被提升并派发。"""
+    started = []
+    lock = threading.Lock()
+    release = threading.Event()
+
+    def handler(payload):
+        if payload == "blocker":
+            release.wait(timeout=5)
+            return
+        time.sleep(0.05)  # 每个高优先级作业占用执行槽 50ms
+        with lock:
+            started.append(payload)
+
+    # aging 阈值 0.3s：20 个高优先级作业共需 ~1s，无 aging 时低优先级会排到最后
+    svc = make_service(handler, max_concurrency=1, aging_threshold=0.3)
+    try:
+        svc.submit("blocker", "blocker")
+        svc.submit("job-low", "low", priority="low")
+        n_high = 20
+        for i in range(n_high):
+            svc.submit(f"job-high-{i}", f"high-{i}", priority="high")
+        release.set()
+        assert svc.wait_idle(timeout=15)
+        low_pos = started.index("low")
+        last_high_pos = started.index(f"high-{n_high - 1}")
+        # 低优先级被提升后插到了队首高优先级之后、队尾高优先级之前
+        assert low_pos < last_high_pos, (
+            f"low starved: low at {low_pos}, last high at {last_high_pos}"
+        )
+        logger.info("anti-starvation: low dispatched at position %d/%d (last high at %d)",
+                    low_pos, len(started), last_high_pos)
+    finally:
+        release.set()
+        svc.stop()
+
+
+def test_maintenance_window_blocks_high_priority_too():
+    """维护窗口期间高优先级也不能插队启动。"""
+    svc = make_service(lambda p: None, max_concurrency=1)
+    try:
+        svc.enter_maintenance()
+        svc.submit("job-urgent", "x", priority="high")
+        time.sleep(0.2)
+        assert svc.get("job-urgent").status == JobStatus.QUEUED
+        svc.exit_maintenance()
+        wait_status(svc, "job-urgent", JobStatus.SUCCEEDED)
+    finally:
+        svc.exit_maintenance()
+        svc.stop()
+
+
+def test_retried_job_keeps_priority_and_requeues_fresh():
+    """重试重新入队：保留原优先级，queued_at 重置，退避后仍能被调度到。"""
+    attempts = {"n": 0}
+
+    def handler(payload):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise RetryableError("transient")
+
+    svc = make_service(handler, max_retries=2)
+    try:
+        svc.submit("job-retry-prio", "x", priority="high")
+        job = wait_status(svc, "job-retry-prio", JobStatus.SUCCEEDED)
+        assert job.attempts == 2
+        assert job.priority == 0  # 重试不丢优先级
+        assert job.queued_at > job.created_at  # 重新入队时 queued_at 已重置
+        logger.info("job=%s retried with priority=%d, queued_at reset",
+                    job.job_id, job.priority)
+    finally:
+        svc.stop()
+
+
+def test_invalid_priority_rejected():
+    """非法优先级取值被拒绝，且不会创建作业。"""
+    svc = make_service(lambda p: None)
+    try:
+        with pytest.raises(ValueError, match="invalid priority"):
+            svc.submit("job-bad-prio", "x", priority="urgent")
+        assert svc.get("job-bad-prio") is None
+        with pytest.raises(TypeError, match="invalid priority type"):
+            svc.submit("job-bad-prio2", "x", priority=True)
+        assert svc.get("job-bad-prio2") is None
+        # 数值优先级：越小越优先，负值按 0 处理
+        job, _ = svc.submit("job-num", "x", priority=3)
+        assert job.priority == 3
+        job2, _ = svc.submit("job-neg", "x", priority=-5)
+        assert job2.priority == 0
+    finally:
+        svc.stop()
+
+
+def test_duplicate_submit_keeps_original_priority():
+    """幂等去重不受优先级影响：重复提交保留首次提交的优先级。"""
+    svc = make_service(lambda p: None)
+    try:
+        job1, created1 = svc.submit("job-dup-prio", "x", priority="low")
+        job2, created2 = svc.submit("job-dup-prio", "x", priority="high")
+        assert created1 is True and created2 is False
+        assert job2.priority == job1.priority == 10  # 仍是首次提交的 low
+        wait_status(svc, "job-dup-prio", JobStatus.SUCCEEDED)
     finally:
         svc.stop()

@@ -34,6 +34,60 @@ class FailureClass(str, enum.Enum):
     FATAL = "FATAL"
 
 
+# 命名优先级档位：数值越小越优先
+PRIORITY_HIGH = 0
+PRIORITY_NORMAL = 5
+PRIORITY_LOW = 10
+
+# 等待超时后被提升到的“插队档”：高于一切普通/自定义档位
+PRIORITY_BOOSTED = -1
+
+_PRIORITY_NAMES: dict[str, int] = {
+    "high": PRIORITY_HIGH,
+    "normal": PRIORITY_NORMAL,
+    "low": PRIORITY_LOW,
+}
+
+DEFAULT_PRIORITY = PRIORITY_NORMAL
+
+
+def normalize_priority(priority: str | int | None) -> int:
+    """把用户输入的优先级归一化为非负整数（越小越优先）。
+
+    - None -> 默认 NORMAL
+    - 命名档位（大小写不敏感）：high / normal / low
+    - 非负整数：自定义档位；负值按 0（最高档）处理
+    - 未知名称抛出 ValueError，其它类型抛出 TypeError
+    """
+    if priority is None:
+        return DEFAULT_PRIORITY
+    if isinstance(priority, bool):
+        raise TypeError(f"invalid priority type: bool ({priority!r})")
+    if isinstance(priority, int):
+        return max(0, priority)
+    if isinstance(priority, str):
+        key = priority.strip().lower()
+        if key in _PRIORITY_NAMES:
+            return _PRIORITY_NAMES[key]
+        raise ValueError(
+            f"invalid priority {priority!r}: expected one of "
+            f"{sorted(_PRIORITY_NAMES)} or a non-negative integer"
+        )
+    raise TypeError(f"invalid priority type: {type(priority).__name__}")
+
+
+def effective_priority(job: Job, now: float, aging_threshold: float) -> int:
+    """计算作业的有效优先级：等待超过 aging_threshold 秒即提升到插队档。
+
+    防饿死（aging）规则：作业自最近一次入队（queued_at）起等待时间单调增长，
+    一旦超过阈值即被提升为 PRIORITY_BOOSTED；提升档内部仍按 queued_at 先来先服务，
+    因此晚入队的作业永远无法越过已提升的作业，任何作业最终都能被派发。
+    """
+    if aging_threshold >= 0 and now - job.queued_at >= aging_threshold:
+        return PRIORITY_BOOSTED
+    return job.priority
+
+
 class InvalidTransitionError(Exception):
     """非法状态迁移。reason 字段给出可区分的原因。"""
 
@@ -62,10 +116,12 @@ class Job:
     status: JobStatus = JobStatus.PENDING
     attempts: int = 0
     max_retries: int = 3
+    priority: int = DEFAULT_PRIORITY  # 归一化后的非负整数，越小越优先
     failure_class: str | None = None
     conclusion: str | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
+    queued_at: float = 0.0  # 最近一次进入 QUEUED 的时刻，用于同级 FIFO 与防饿死计时
     not_before: float = 0.0  # 退避后的最早可调度时间
     history: list[str] = field(default_factory=list)
 

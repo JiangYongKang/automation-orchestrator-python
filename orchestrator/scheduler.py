@@ -6,7 +6,12 @@ import threading
 import time
 
 from .executor import JobHandler, execute
-from .models import FailureClass, Job, JobStatus, validate_transition
+from .models import (
+    FailureClass,
+    JobStatus,
+    effective_priority,
+    validate_transition,
+)
 from .store import JobStore
 
 logger = logging.getLogger("orchestrator.scheduler")
@@ -16,8 +21,11 @@ class Scheduler:
     """后台线程驱动的调度循环。
 
     - 并发上限：同时在 RUNNING 的作业数不超过 max_concurrency，超出部分留在队列。
+    - 优先级调度：有效优先级高的先派发，同优先级内按入队时间（queued_at）先来先服务。
+    - 防饿死：作业等待超过 aging_threshold 秒即被提升到插队档（见 models.effective_priority）。
     - 维护窗口：窗口内不启动新作业；窗口开始时仍在执行的作业继续跑完（drain 语义）。
-    - 重试退避：可重试失败按 backoff_base * 2^(attempts-1) 退避后重新入队。
+    - 重试退避：可重试失败按 backoff_base * 2^(attempts-1) 退避后重新入队；
+      重新入队保留原优先级，queued_at 重置为重新入队时刻。
     """
 
     def __init__(
@@ -27,12 +35,14 @@ class Scheduler:
         max_concurrency: int = 2,
         backoff_base: float = 0.1,
         tick_interval: float = 0.02,
+        aging_threshold: float = 30.0,
     ) -> None:
         self._store = store
         self._handler = handler
         self._max_concurrency = max_concurrency
         self._backoff_base = backoff_base
         self._tick_interval = tick_interval
+        self._aging_threshold = aging_threshold
         self._maintenance = threading.Event()
         self._stop = threading.Event()
         self._cond = threading.Condition()
@@ -100,7 +110,7 @@ class Scheduler:
                 self._cond.wait(timeout=self._tick_interval)
 
     def _tick(self) -> None:
-        """单轮调度：在并发余量内从队列取作业并派发到工作线程。"""
+        """单轮调度：在并发余量内按 (有效优先级, 入队时间) 取作业并派发到工作线程。"""
         if self._maintenance.is_set():
             return
         now = time.time()
@@ -108,7 +118,11 @@ class Scheduler:
             capacity = self._max_concurrency - self._running
         if capacity <= 0:
             return
-        for job in self._store.list_by_status(JobStatus.QUEUED):
+        queued = self._store.list_by_status(JobStatus.QUEUED)
+        # 有效优先级（含防饿死提升）高的在前；同级按入队时间 FIFO，job_id 兜底保证稳定
+        queued.sort(key=lambda j: (effective_priority(j, now, self._aging_threshold),
+                                   j.queued_at, j.job_id))
+        for job in queued:
             if capacity <= 0:
                 break
             if job.not_before > now:
@@ -149,9 +163,10 @@ class Scheduler:
                 logger.info("job=%s transition RUNNING->SUCCEEDED", job_id)
             elif result.failure_class == FailureClass.RETRYABLE and fresh.attempts <= fresh.max_retries:
                 delay = self._backoff_base * (2 ** (fresh.attempts - 1))
+                # 重新入队：保留原优先级，queued_at 重置（防饿死计时重新起算），退避照常生效
                 self._store.compare_and_swap_status(
                     job_id, JobStatus.RUNNING, JobStatus.QUEUED,
-                    updated_at=now, not_before=now + delay,
+                    updated_at=now, queued_at=now, not_before=now + delay,
                     failure_class=result.failure_class.value,
                     history=fresh.history + [
                         f"RUNNING->QUEUED retry attempt={fresh.attempts} "

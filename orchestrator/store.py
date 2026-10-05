@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 
 from .models import Job, JobStatus
 
@@ -14,14 +15,22 @@ CREATE TABLE IF NOT EXISTS jobs (
     status TEXT NOT NULL,
     attempts INTEGER NOT NULL,
     max_retries INTEGER NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 5,
     failure_class TEXT,
     conclusion TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
+    queued_at REAL NOT NULL DEFAULT 0,
     not_before REAL NOT NULL,
     history TEXT NOT NULL
 )
 """
+
+# 老版本库缺少的列：(列名, DDL)，启动时按需 ALTER TABLE 补齐
+_MIGRATIONS: tuple[tuple[str, str], ...] = (
+    ("priority", "ALTER TABLE jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT 5"),
+    ("queued_at", "ALTER TABLE jobs ADD COLUMN queued_at REAL NOT NULL DEFAULT 0"),
+)
 
 
 class JobStore:
@@ -34,20 +43,28 @@ class JobStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute(_SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """对老版本库按需补列（幂等）。"""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(jobs)")}
+        for name, ddl in _MIGRATIONS:
+            if name not in cols:
+                self._conn.execute(ddl)
 
     def save(self, job: Job) -> None:
         """插入或更新作业记录（按 job_id 覆盖）。"""
         with self._lock:
             self._conn.execute(
                 """INSERT OR REPLACE INTO jobs
-                   (job_id, payload, status, attempts, max_retries, failure_class,
-                    conclusion, created_at, updated_at, not_before, history)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                   (job_id, payload, status, attempts, max_retries, priority, failure_class,
+                    conclusion, created_at, updated_at, queued_at, not_before, history)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     job.job_id, job.payload, job.status.value, job.attempts,
-                    job.max_retries, job.failure_class, job.conclusion,
-                    job.created_at, job.updated_at, job.not_before,
+                    job.max_retries, job.priority, job.failure_class, job.conclusion,
+                    job.created_at, job.updated_at, job.queued_at, job.not_before,
                     json.dumps(job.history),
                 ),
             )
@@ -94,15 +111,19 @@ class JobStore:
         return [self._to_job(r) for r in rows]
 
     def recover_interrupted(self) -> list[str]:
-        """把崩溃时停留在 RUNNING 的作业重置为 QUEUED，返回受影响的 job_id。"""
+        """把崩溃时停留在 RUNNING 的作业重置为 QUEUED，返回受影响的 job_id。
+
+        恢复时把 queued_at 重置为当前时刻：防饿死计时从恢复后重新起算，
+        崩溃前已等待的时长不计入（崩溃期间系统不在正常运转）。
+        """
         with self._lock:
             rows = self._conn.execute(
                 "SELECT job_id FROM jobs WHERE status = ?", (JobStatus.RUNNING.value,)
             ).fetchall()
             ids = [r["job_id"] for r in rows]
             self._conn.execute(
-                "UPDATE jobs SET status = ? WHERE status = ?",
-                (JobStatus.QUEUED.value, JobStatus.RUNNING.value),
+                "UPDATE jobs SET status = ?, queued_at = ? WHERE status = ?",
+                (JobStatus.QUEUED.value, time.time(), JobStatus.RUNNING.value),
             )
             self._conn.commit()
         return ids
@@ -119,10 +140,12 @@ class JobStore:
             status=JobStatus(row["status"]),
             attempts=row["attempts"],
             max_retries=row["max_retries"],
+            priority=row["priority"],
             failure_class=row["failure_class"],
             conclusion=row["conclusion"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            queued_at=row["queued_at"],
             not_before=row["not_before"],
             history=json.loads(row["history"]),
         )

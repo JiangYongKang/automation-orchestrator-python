@@ -25,6 +25,7 @@ service = OrchestratorService(
     demo_handler,
     db_path=os.environ.get("ORCH_DB", ":memory:"),
     max_concurrency=int(os.environ.get("ORCH_MAX_CONCURRENCY", "2")),
+    aging_threshold=float(os.environ.get("ORCH_AGING_THRESHOLD", "30")),
 )
 
 
@@ -42,6 +43,7 @@ class SubmitRequest(BaseModel):
     job_id: str
     payload: str
     max_retries: int | None = None
+    priority: str | int | None = None  # high/normal/low 或非负整数，默认 normal
 
 
 @app.get("/")
@@ -51,10 +53,16 @@ def read_root():
 
 @app.post("/jobs", status_code=201)
 def submit_job(req: SubmitRequest):
-    job, created = service.submit(req.job_id, req.payload, req.max_retries)
+    try:
+        job, created = service.submit(
+            req.job_id, req.payload, req.max_retries, priority=req.priority
+        )
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     return {
         "job_id": job.job_id,
         "status": job.status.value,
+        "priority": job.priority,
         "created": created,  # False 表示幂等去重命中
     }
 
@@ -68,6 +76,7 @@ def get_job(job_id: str):
         "job_id": job.job_id,
         "status": job.status.value,
         "attempts": job.attempts,
+        "priority": job.priority,
         "failure_class": job.failure_class,
         "conclusion": job.conclusion,
         "history": job.history,
