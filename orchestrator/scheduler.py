@@ -1,7 +1,8 @@
-"""进程内调度器：并发上限、FIFO 排队、维护窗口、重试退避。"""
+"""进程内调度器：并发上限、优先级排队（同级 FIFO）、防饿死老化、维护窗口、重试退避。"""
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 
@@ -12,12 +13,28 @@ from .store import JobStore
 logger = logging.getLogger("orchestrator.scheduler")
 
 
+def effective_priority(job: Job, now: float, aging_interval: float, aging_step: int) -> int:
+    """计算作业的动态优先级：静态优先级 + 等待老化加成。
+
+    每在队列中等待满一个 aging_interval，有效优先级提升 aging_step。
+    等待时长按最近一次入队时间（queued_at）计，重试重新入队时重新计时。
+    """
+    waited = max(0.0, now - job.queued_at)
+    if aging_interval <= 0:
+        return job.priority
+    return job.priority + aging_step * math.floor(waited / aging_interval)
+
+
 class Scheduler:
     """后台线程驱动的调度循环。
 
     - 并发上限：同时在 RUNNING 的作业数不超过 max_concurrency，超出部分留在队列。
+    - 优先级调度：有效优先级高者先派发；同一有效优先级内部按入队时间先来先服务。
+    - 防饿死老化：每等待满 aging_interval 秒，有效优先级提升 aging_step，
+      只要新到作业的静态优先级有上界，任何作业最终都会被派发。
     - 维护窗口：窗口内不启动新作业；窗口开始时仍在执行的作业继续跑完（drain 语义）。
-    - 重试退避：可重试失败按 backoff_base * 2^(attempts-1) 退避后重新入队。
+    - 重试退避：可重试失败按 backoff_base * 2^(attempts-1) 退避后重新入队；
+      重新入队保留原静态优先级，老化计时从重新入队时刻重新开始。
     """
 
     def __init__(
@@ -27,12 +44,16 @@ class Scheduler:
         max_concurrency: int = 2,
         backoff_base: float = 0.1,
         tick_interval: float = 0.02,
+        aging_interval: float = 1.0,
+        aging_step: int = 1,
     ) -> None:
         self._store = store
         self._handler = handler
         self._max_concurrency = max_concurrency
         self._backoff_base = backoff_base
         self._tick_interval = tick_interval
+        self._aging_interval = aging_interval
+        self._aging_step = aging_step
         self._maintenance = threading.Event()
         self._stop = threading.Event()
         self._cond = threading.Condition()
@@ -100,7 +121,7 @@ class Scheduler:
                 self._cond.wait(timeout=self._tick_interval)
 
     def _tick(self) -> None:
-        """单轮调度：在并发余量内从队列取作业并派发到工作线程。"""
+        """单轮调度：在并发余量内按有效优先级从队列取作业并派发到工作线程。"""
         if self._maintenance.is_set():
             return
         now = time.time()
@@ -108,11 +129,9 @@ class Scheduler:
             capacity = self._max_concurrency - self._running
         if capacity <= 0:
             return
-        for job in self._store.list_by_status(JobStatus.QUEUED):
+        for job in self._dispatch_order(now):
             if capacity <= 0:
                 break
-            if job.not_before > now:
-                continue  # 退避中，未到可调度时间
             validate_transition(job.job_id, JobStatus.QUEUED, JobStatus.RUNNING)
             claimed = self._store.compare_and_swap_status(
                 job.job_id, JobStatus.QUEUED, JobStatus.RUNNING,
@@ -124,12 +143,30 @@ class Scheduler:
             with self._cond:
                 self._running += 1
                 capacity -= 1
-            logger.info("job=%s transition QUEUED->RUNNING attempt=%d",
-                        job.job_id, job.attempts + 1)
+            logger.info("job=%s transition QUEUED->RUNNING attempt=%d priority=%d",
+                        job.job_id, job.attempts + 1, job.priority)
             threading.Thread(
                 target=self._run_job, args=(job.job_id,), daemon=True,
                 name=f"job-{job.job_id}",
             ).start()
+
+    def _dispatch_order(self, now: float) -> list[Job]:
+        """可派发作业排序：有效优先级降序，同级按入队时间升序（FIFO）。
+
+        退避中（not_before 未到）的作业本轮不参与派发。
+        """
+        ready = [
+            job for job in self._store.list_by_status(JobStatus.QUEUED)
+            if job.not_before <= now
+        ]
+        return sorted(
+            ready,
+            key=lambda job: (
+                -effective_priority(job, now, self._aging_interval, self._aging_step),
+                job.queued_at,
+                job.job_id,
+            ),
+        )
 
     def _run_job(self, job_id: str) -> None:
         """执行单个作业并处理重试 / 终态收敛，异常不外溢。"""
@@ -149,9 +186,10 @@ class Scheduler:
                 logger.info("job=%s transition RUNNING->SUCCEEDED", job_id)
             elif result.failure_class == FailureClass.RETRYABLE and fresh.attempts <= fresh.max_retries:
                 delay = self._backoff_base * (2 ** (fresh.attempts - 1))
+                # 重新入队：保留原静态优先级，老化计时从重新入队时刻重新开始
                 self._store.compare_and_swap_status(
                     job_id, JobStatus.RUNNING, JobStatus.QUEUED,
-                    updated_at=now, not_before=now + delay,
+                    updated_at=now, not_before=now + delay, queued_at=now,
                     failure_class=result.failure_class.value,
                     history=fresh.history + [
                         f"RUNNING->QUEUED retry attempt={fresh.attempts} "

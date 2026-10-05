@@ -107,7 +107,10 @@ def test_retryable_failure_retries_then_succeeds(caplog):
         assert attempts["n"] == 3
         assert job.attempts == 3
         logger.info("job=%s succeeded after %d attempts", job.job_id, job.attempts)
-        retry_logs = [r for r in caplog.records if "class=RETRYABLE" in r.getMessage()]
+        retry_logs = [
+            r for r in caplog.records
+            if r.name == "orchestrator.scheduler" and "class=RETRYABLE" in r.getMessage()
+        ]
         assert len(retry_logs) == 2  # 前两次失败被分类为可重试
     finally:
         svc.stop()

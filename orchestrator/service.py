@@ -5,7 +5,7 @@ import logging
 import time
 
 from .executor import JobHandler
-from .models import Job, JobStatus, validate_transition
+from .models import Job, JobStatus, normalize_priority, validate_transition
 from .scheduler import Scheduler
 from .store import JobStore
 
@@ -21,14 +21,26 @@ class OrchestratorService:
         db_path: str = ":memory:",
         max_concurrency: int = 2,
         max_retries: int = 3,
+        aging_interval: float = 1.0,
+        aging_step: int = 1,
     ) -> None:
         self._store = JobStore(db_path)
-        self._scheduler = Scheduler(self._store, handler, max_concurrency=max_concurrency)
+        self._scheduler = Scheduler(
+            self._store, handler, max_concurrency=max_concurrency,
+            aging_interval=aging_interval, aging_step=aging_step,
+        )
         self._default_max_retries = max_retries
 
-    def submit(self, job_id: str, payload: str, max_retries: int | None = None) -> tuple[Job, bool]:
+    def submit(
+        self,
+        job_id: str,
+        payload: str,
+        max_retries: int | None = None,
+        priority: str | int | None = None,
+    ) -> tuple[Job, bool]:
         """提交作业；同 ID 重复提交返回已有作业（幂等去重）。
 
+        priority 接受命名级别（high/normal/low）或任意整数，缺省为 normal。
         返回 (job, created)：created=False 表示命中幂等去重，不重复入队。
         """
         existing = self._store.get(job_id)
@@ -42,15 +54,18 @@ class OrchestratorService:
             payload=payload,
             status=JobStatus.PENDING,
             max_retries=max_retries if max_retries is not None else self._default_max_retries,
+            priority=normalize_priority(priority),
             created_at=now,
             updated_at=now,
+            queued_at=now,
             history=["created"],
         )
         validate_transition(job_id, JobStatus.PENDING, JobStatus.QUEUED)
         job.status = JobStatus.QUEUED
         job.history.append("PENDING->QUEUED")
         self._store.save(job)
-        logger.info("job=%s submitted, transition PENDING->QUEUED", job_id)
+        logger.info("job=%s submitted, transition PENDING->QUEUED priority=%d",
+                    job_id, job.priority)
         self._scheduler.notify()
         return job, True
 

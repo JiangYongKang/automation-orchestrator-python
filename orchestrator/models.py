@@ -34,6 +34,44 @@ class FailureClass(str, enum.Enum):
     FATAL = "FATAL"
 
 
+# 命名优先级 -> 数值（数值越大越优先；也允许直接提交任意整数）
+PRIORITY_LEVELS: dict[str, int] = {
+    "low": -10,
+    "normal": 0,
+    "high": 10,
+}
+
+DEFAULT_PRIORITY: int = PRIORITY_LEVELS["normal"]
+
+
+def normalize_priority(priority: str | int | None) -> int:
+    """把提交时的优先级规范化为整数。
+
+    接受命名级别（high/normal/low，大小写不敏感）或任意整数；
+    None 表示未指定，取默认 normal。类型不合法抛 TypeError，
+    字符串无法解析抛 ValueError。
+    """
+    if priority is None:
+        return DEFAULT_PRIORITY
+    if isinstance(priority, bool):  # bool 是 int 子类，单独拒绝避免歧义
+        raise TypeError(f"invalid priority type: {priority!r}")
+    if isinstance(priority, int):
+        return priority
+    if isinstance(priority, str):
+        key = priority.strip().lower()
+        if key in PRIORITY_LEVELS:
+            return PRIORITY_LEVELS[key]
+        try:
+            return int(key)
+        except ValueError:
+            pass
+        raise ValueError(
+            f"invalid priority: {priority!r}; "
+            f"expected one of {sorted(PRIORITY_LEVELS)} or an integer"
+        ) from None
+    raise TypeError(f"invalid priority type: {type(priority).__name__}")
+
+
 class InvalidTransitionError(Exception):
     """非法状态迁移。reason 字段给出可区分的原因。"""
 
@@ -62,10 +100,12 @@ class Job:
     status: JobStatus = JobStatus.PENDING
     attempts: int = 0
     max_retries: int = 3
+    priority: int = DEFAULT_PRIORITY  # 数值越大越优先
     failure_class: str | None = None
     conclusion: str | None = None
     created_at: float = 0.0
     updated_at: float = 0.0
+    queued_at: float = 0.0  # 最近一次进入队列的时间（防饿死老化计时起点）
     not_before: float = 0.0  # 退避后的最早可调度时间
     history: list[str] = field(default_factory=list)
 

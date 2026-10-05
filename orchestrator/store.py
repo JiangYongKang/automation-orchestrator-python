@@ -14,14 +14,22 @@ CREATE TABLE IF NOT EXISTS jobs (
     status TEXT NOT NULL,
     attempts INTEGER NOT NULL,
     max_retries INTEGER NOT NULL,
+    priority INTEGER NOT NULL DEFAULT 0,
     failure_class TEXT,
     conclusion TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
+    queued_at REAL NOT NULL DEFAULT 0,
     not_before REAL NOT NULL,
     history TEXT NOT NULL
 )
 """
+
+# 旧库补充新列（ALTER TABLE 幂等迁移）：列名 -> 定义
+_MIGRATIONS: dict[str, str] = {
+    "priority": "INTEGER NOT NULL DEFAULT 0",
+    "queued_at": "REAL NOT NULL DEFAULT 0",
+}
 
 
 class JobStore:
@@ -34,20 +42,30 @@ class JobStore:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.execute(_SCHEMA)
+            self._migrate()
             self._conn.commit()
+
+    def _migrate(self) -> None:
+        """为旧版本库补充缺失的列（幂等）。"""
+        existing = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(jobs)")
+        }
+        for column, definition in _MIGRATIONS.items():
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
 
     def save(self, job: Job) -> None:
         """插入或更新作业记录（按 job_id 覆盖）。"""
         with self._lock:
             self._conn.execute(
                 """INSERT OR REPLACE INTO jobs
-                   (job_id, payload, status, attempts, max_retries, failure_class,
-                    conclusion, created_at, updated_at, not_before, history)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                   (job_id, payload, status, attempts, max_retries, priority, failure_class,
+                    conclusion, created_at, updated_at, queued_at, not_before, history)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     job.job_id, job.payload, job.status.value, job.attempts,
-                    job.max_retries, job.failure_class, job.conclusion,
-                    job.created_at, job.updated_at, job.not_before,
+                    job.max_retries, job.priority, job.failure_class, job.conclusion,
+                    job.created_at, job.updated_at, job.queued_at, job.not_before,
                     json.dumps(job.history),
                 ),
             )
@@ -119,10 +137,12 @@ class JobStore:
             status=JobStatus(row["status"]),
             attempts=row["attempts"],
             max_retries=row["max_retries"],
+            priority=row["priority"],
             failure_class=row["failure_class"],
             conclusion=row["conclusion"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            queued_at=row["queued_at"],
             not_before=row["not_before"],
             history=json.loads(row["history"]),
         )
